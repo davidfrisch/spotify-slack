@@ -51,11 +51,9 @@ def load_slack_user_identity():
     data = response.json()
 
     if not data.get("ok"):
-        print("Failed to load Slack user identity:", data)
         return
 
     slack_user_name = data["profile"]["real_name"]  # real name
-    print(f"Loaded Slack user name: {slack_user_name}")
 
 
 # ----- Spotify OAuth -----
@@ -211,4 +209,4 @@ async def startup_event():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="error")
