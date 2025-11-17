@@ -118,6 +118,8 @@ def get_current_track():
         "artist": ", ".join([a["name"] for a in track["artists"]]),
         "album_cover": track["album"]["images"][0]["url"],
         "url": track["external_urls"]["spotify"],
+        "duration_ms": track["duration_ms"],
+        "progress_ms": data.get("progress_ms", 0),
     }
 
 
@@ -149,6 +151,9 @@ def update_slack_status(track):
     # Compute remaining time
     remaining_ms = max(duration_ms - progress_ms, 0)
     remaining_seconds = remaining_ms // 1000
+
+    # Add a buffer of 10 seconds
+    remaining_seconds += 10
 
     # Slack expects a UNIX timestamp
     expiration_timestamp = int(time.time()) + remaining_seconds
