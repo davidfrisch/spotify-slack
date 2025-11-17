@@ -48,7 +48,6 @@ def load_slack_user_identity():
         "https://slack.com/api/users.profile.get",
         headers={"Authorization": f"Bearer {SLACK_USER_TOKEN}"},
     )
-    print(response.text)
     data = response.json()
 
     if not data.get("ok"):
