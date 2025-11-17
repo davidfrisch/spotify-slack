@@ -153,7 +153,7 @@ def update_slack_status(track):
     remaining_seconds = remaining_ms // 1000
 
     # Add a buffer of 10 seconds
-    remaining_seconds += 10
+    remaining_seconds += 60
 
     # Slack expects a UNIX timestamp
     expiration_timestamp = int(time.time()) + remaining_seconds
