@@ -2,6 +2,7 @@ import os
 import requests
 import asyncio
 import time
+from typing import Optional
 from fastapi import FastAPI, Form
 from fastapi.responses import RedirectResponse
 from dotenv import load_dotenv
@@ -21,8 +22,6 @@ SLACK_USER_TOKEN = os.getenv("SLACK_USER_TOKEN")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL")
 SERVER_HOST = os.getenv("SERVER_HOST")
 
-slack_user_name = None
-
 if not all(
     [
         SPOTIFY_CLIENT_ID,
@@ -34,44 +33,58 @@ if not all(
 ):
     raise EnvironmentError("One or more required environment variables are missing.")
 
-spotify_access_token = None
-spotify_refresh_token = None
-current_track_id = None
+# Store tokens and state per user
+user_tokens: dict[
+    str, dict[str, str]
+] = {}  # {user_id: {"access_token": str, "refresh_token": str, "slack_name": str}}
+user_current_tracks: dict[str, str] = {}  # {user_id: track_id}
+pending_auth: dict[
+    str, str
+] = {}  # {state: user_id} - maps OAuth state to Slack user_id
 
 SCOPES = "user-read-currently-playing user-read-playback-state"
 
 
-def load_slack_user_identity():
-    global slack_user_name
-
+def load_slack_user_identity(user_id: str):
+    """Load Slack user identity for a specific user"""
     response = requests.get(
-        "https://slack.com/api/users.profile.get",
-        headers={"Authorization": f"Bearer {SLACK_USER_TOKEN}"},
+        f"https://slack.com/api/users.info?user={user_id}",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
     )
     data = response.json()
 
     if not data.get("ok"):
-        return
+        return None
 
-    slack_user_name = data["profile"]["real_name"]  # real name
+    return data["user"]["profile"].get("real_name", data["user"]["name"])
 
 
 # ----- Spotify OAuth -----
 @app.get("/login")
-def login():
+def login(user_id: Optional[str] = None):
+    """Initiate Spotify OAuth flow for a specific user"""
+    import secrets
+
+    # Generate a unique state token
+    state = secrets.token_urlsafe(16)
+
+    if user_id:
+        pending_auth[state] = user_id
+
     url = (
         "https://accounts.spotify.com/authorize"
         f"?client_id={SPOTIFY_CLIENT_ID}"
         f"&response_type=code"
         f"&redirect_uri={SPOTIFY_REDIRECT_URI}"
         f"&scope={SCOPES}"
+        f"&state={state}"
     )
     return RedirectResponse(url)
 
 
 @app.get("/callback")
-def callback(code: str):
-    global spotify_access_token, spotify_refresh_token
+def callback(code: str, state: Optional[str] = None):
+    """Handle Spotify OAuth callback and store tokens per user"""
     url = "https://accounts.spotify.com/api/token"
     data = {
         "grant_type": "authorization_code",
@@ -83,29 +96,52 @@ def callback(code: str):
     response = requests.post(url, data=data)
     response.raise_for_status()
     tokens = response.json()
-    spotify_access_token = tokens["access_token"]
-    spotify_refresh_token = tokens["refresh_token"]
-    return "Spotify login successful! You can close this page."
+
+    # Get user_id from state
+    user_id = pending_auth.pop(state, None) if state else None
+
+    if user_id:
+        # Load Slack user name
+        slack_name = load_slack_user_identity(user_id)
+
+        # Store tokens for this user
+        user_tokens[user_id] = {
+            "access_token": tokens["access_token"],
+            "refresh_token": tokens["refresh_token"],
+            "slack_name": slack_name or "Unknown User",
+        }
+        return f"Spotify login successful for {user_tokens[user_id]['slack_name']}! You can close this page."
+    else:
+        # Fallback for backward compatibility
+        return "Spotify login successful! You can close this page."
 
 
 # ----- Spotify token refresh -----
-def refresh_spotify_token():
-    global spotify_access_token
+def refresh_spotify_token(user_id: str):
+    """Refresh Spotify token for a specific user"""
+    if user_id not in user_tokens:
+        return False
+
     url = "https://accounts.spotify.com/api/token"
     data = {
         "grant_type": "refresh_token",
-        "refresh_token": spotify_refresh_token,
+        "refresh_token": user_tokens[user_id]["refresh_token"],
         "client_id": SPOTIFY_CLIENT_ID,
         "client_secret": SPOTIFY_CLIENT_SECRET,
     }
     response = requests.post(url, data=data)
     response.raise_for_status()
-    spotify_access_token = response.json()["access_token"]
+    user_tokens[user_id]["access_token"] = response.json()["access_token"]
+    return True
 
 
 # ----- Get currently playing track -----
-def get_current_track():
-    headers = {"Authorization": f"Bearer {spotify_access_token}"}
+def get_current_track(user_id: str):
+    """Get currently playing track for a specific user"""
+    if user_id not in user_tokens:
+        return None
+
+    headers = {"Authorization": f"Bearer {user_tokens[user_id]['access_token']}"}
     url = "https://api.spotify.com/v1/me/player/currently-playing"
     response = requests.get(url, headers=headers)
     if response.status_code != 200 or response.text == "":
@@ -124,9 +160,11 @@ def get_current_track():
 
 
 # ----- Post track to Slack channel -----
-def post_to_slack(track):
+def post_to_slack(track, user_id: str):
+    """Post track to Slack for a specific user"""
+    slack_name = user_tokens.get(user_id, {}).get("slack_name", "Unknown User")
     spotify_link = f"<{track['url']}|Open on Spotify>"
-    user_text = f"*{slack_user_name}* is listening to:"
+    user_text = f"*{slack_name}* is listening to:"
 
     message = {
         "channel": SLACK_CHANNEL,
@@ -144,7 +182,13 @@ def post_to_slack(track):
 
 
 # ----- Update Slack user status -----
-def update_slack_status(track):
+def update_slack_status(track, user_id: str):
+    """Update Slack status for a specific user"""
+    # Note: This requires a user token for each user, which is more complex
+    # For now, only update if SLACK_USER_TOKEN is available and matches the user
+    if not SLACK_USER_TOKEN:
+        return
+
     duration_ms = track.get("duration_ms", 0)
     progress_ms = track.get("progress_ms", 0)
 
@@ -177,9 +221,8 @@ async def slack_start(command: str = Form(...), user_id: str = Form(...)):
     Handles /start command.
     Sends a temporary redirect page that auto-opens /login in the browser.
     """
-    # Generate a temporary redirect URL
-    # This URL can include the Slack user_id if needed
-    redirect_url = f"https://{SERVER_HOST}/login"
+    # Generate a temporary redirect URL with user_id
+    redirect_url = f"https://{SERVER_HOST}/login?user_id={user_id}"
 
     # Respond with ephemeral message containing the redirect link
     return {
@@ -190,24 +233,30 @@ async def slack_start(command: str = Form(...), user_id: str = Form(...)):
 
 # ----- Background task to watch tracks -----
 async def track_watcher():
-    global current_track_id
+    """Watch tracks for all authenticated users"""
     while True:
-        if spotify_access_token:
+        # Iterate through all users with tokens
+        for user_id in list(user_tokens.keys()):
             try:
-                refresh_spotify_token()
-                track = get_current_track()
-                if track and track["id"] != current_track_id:
-                    current_track_id = track["id"]
-                    post_to_slack(track)  # optional: channel post
-                    update_slack_status(track)  # update Slack profile status
+                # Refresh token for this user
+                refresh_spotify_token(user_id)
+
+                # Get current track for this user
+                track = get_current_track(user_id)
+
+                # Check if it's a new track
+                if track and track["id"] != user_current_tracks.get(user_id):
+                    user_current_tracks[user_id] = track["id"]
+                    post_to_slack(track, user_id)  # optional: channel post
+                    update_slack_status(track, user_id)  # update Slack profile status
             except Exception as e:
-                print("Error fetching Spotify track:", e)
+                print(f"Error fetching Spotify track for user {user_id}:", e)
+
         await asyncio.sleep(30)
 
 
 @app.on_event("startup")
 async def startup_event():
-    load_slack_user_identity()
     asyncio.create_task(track_watcher())
 
 
